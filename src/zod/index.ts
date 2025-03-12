@@ -298,7 +298,6 @@ export class ZodSchemaVisitor extends BaseSchemaVisitor {
         },
       });
       return indent(`z.object({\n`, 2)
-        + indent(`  __typename: z.literal("${fieldName}"),\n`, 2)
         + indent(`  ${fieldName}: ${fieldSchema}\n`, 2)
         + indent(`})`, 2);
     }).join(',\n');
@@ -309,7 +308,7 @@ export class ZodSchemaVisitor extends BaseSchemaVisitor {
           .export()
           .asKind('const')
           .withName(`${name}Schema`)
-          .withContent(`z.discriminatedUnion("__typename", [\n  ${variants}\n])`)
+          .withContent(`z.union("[\n  ${variants}\n])`)
           .string;
 
       case 'function':
@@ -319,7 +318,7 @@ export class ZodSchemaVisitor extends BaseSchemaVisitor {
           .asKind('function')
           .withName(`${name}Schema(): z.ZodSchema<${name}>`)
           .withBlock([
-            indent(`return z.discriminatedUnion("__typename", [`),
+            indent(`return z.union([`),
             variants,
             indent(`]);`),
           ].join('\n'))
