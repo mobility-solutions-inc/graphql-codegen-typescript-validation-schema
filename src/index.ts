@@ -3,35 +3,45 @@ import type { GraphQLSchema } from 'graphql';
 import type { ValidationSchemaPluginConfig } from './config.js';
 import type { SchemaVisitor } from './types.js';
 import { transformSchemaAST } from '@graphql-codegen/schema-ast';
-import { buildSchema, printSchema, visit } from 'graphql';
+import { buildSchema, Kind, printSchema, visit } from 'graphql';
 
 import { isGeneratedByIntrospection, topologicalSortAST } from './graphql.js';
 import { MyZodSchemaVisitor } from './myzod/index.js';
 import { ValibotSchemaVisitor } from './valibot/index.js';
 import { YupSchemaVisitor } from './yup/index.js';
 import { ZodSchemaVisitor } from './zod/index.js';
+import { ZodV4SchemaVisitor } from './zodv4/index.js';
 
 export const plugin: PluginFunction<ValidationSchemaPluginConfig, Types.ComplexPluginOutput> = (
   schema: GraphQLSchema,
-  _documents: Types.DocumentFile[],
+  documents: Types.DocumentFile[],
   config: ValidationSchemaPluginConfig,
 ): Types.ComplexPluginOutput => {
   const { schema: _schema, ast } = _transformSchemaAST(schema, config);
   const visitor = schemaVisitor(_schema, config);
 
-  const result = visit(ast, visitor);
+  const visitAst = config.onlyEnums
+    ? { ...ast, definitions: ast.definitions.filter(def => def.kind === Kind.ENUM_TYPE_DEFINITION) }
+    : ast;
+
+  const result = visit(visitAst, visitor);
 
   const generated = result.definitions.filter(def => typeof def === 'string');
+  const operationDefinitions = config.withOperationType === true && config.onlyEnums !== true
+    ? visitor.buildOperationDefinitions(documents)
+    : [];
 
   return {
     prepend: visitor.buildImports(),
-    content: [visitor.initialEmit(), ...generated].join('\n'),
+    content: [visitor.initialEmit(), ...generated, ...operationDefinitions].join('\n'),
   };
 };
 
 function schemaVisitor(schema: GraphQLSchema, config: ValidationSchemaPluginConfig): SchemaVisitor {
   if (config?.schema === 'zod')
     return new ZodSchemaVisitor(schema, config);
+  if (config?.schema === 'zodv4')
+    return new ZodV4SchemaVisitor(schema, config);
   else if (config?.schema === 'myzod')
     return new MyZodSchemaVisitor(schema, config);
   else if (config?.schema === 'valibot')
