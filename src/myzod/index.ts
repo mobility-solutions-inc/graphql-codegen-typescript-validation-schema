@@ -22,12 +22,13 @@ import { buildApi, formatDirectiveConfig } from '../directive.js';
 import {
   escapeGraphQLCharacters,
   InterfaceTypeDefinitionBuilder,
-  isInput,
   isListType,
   isNamedType,
   isNonNullType,
   ObjectTypeDefinitionBuilder,
 } from '../graphql.js';
+import { buildMaybeLazy } from '../lazy.js';
+import { buildScalarSchema } from '../scalar.js';
 import { BaseSchemaVisitor } from '../schema_visitor.js';
 
 const anySchema = `definedNonNullAnySchema`;
@@ -162,9 +163,11 @@ export class MyZodSchemaVisitor extends BaseSchemaVisitor {
     return {
       leave: (node: EnumTypeDefinitionNode) => {
         const visitor = this.createVisitor('both');
-        const enumname = visitor.convertName(node.name.value);
+        const enumname = visitor.convertSchemaName(node.name.value, node.kind);
         const enumTypeName = visitor.prefixTypeNamespace(enumname);
         this.importTypes.push(enumname);
+        if (!this.config.enumsAsTypes)
+          this.importValueTypes.push(enumname);
         // z.enum are basically myzod.literals
         // hoist enum declarations
         this.enumDeclarations.push(
@@ -262,22 +265,22 @@ export class MyZodSchemaVisitor extends BaseSchemaVisitor {
 
 function generateFieldMyZodSchema(config: ValidationSchemaPluginConfig, visitor: Visitor, field: InputValueDefinitionNode | FieldDefinitionNode, indentCount: number): string {
   const gen = generateFieldTypeMyZodSchema(config, visitor, field, field.type);
-  return indent(`${field.name.value}: ${maybeLazy(field.type, gen)}`, indentCount);
+  return indent(`${field.name.value}: ${maybeLazy(visitor, field.type, gen)}`, indentCount);
 }
 
 function generateFieldTypeMyZodSchema(config: ValidationSchemaPluginConfig, visitor: Visitor, field: InputValueDefinitionNode | FieldDefinitionNode, type: TypeNode, parentType?: TypeNode): string {
   if (isListType(type)) {
     const gen = generateFieldTypeMyZodSchema(config, visitor, field, type.type, type);
     if (!isNonNullType(parentType)) {
-      const arrayGen = `myzod.array(${maybeLazy(type.type, gen)})`;
+      const arrayGen = `myzod.array(${maybeLazy(visitor, type.type, gen)})`;
       const maybeLazyGen = applyDirectives(config, field, arrayGen);
       return `${maybeLazyGen}.optional().nullable()`;
     }
-    return `myzod.array(${maybeLazy(type.type, gen)})`;
+    return `myzod.array(${maybeLazy(visitor, type.type, gen)})`;
   }
   if (isNonNullType(type)) {
     const gen = generateFieldTypeMyZodSchema(config, visitor, field, type.type, type);
-    return maybeLazy(type.type, gen);
+    return maybeLazy(visitor, type.type, gen);
   }
   if (isNamedType(type)) {
     const gen = generateNameNodeMyZodSchema(config, visitor, type.name);
@@ -299,7 +302,10 @@ function generateFieldTypeMyZodSchema(config: ValidationSchemaPluginConfig, visi
           if (config.namingConvention?.enumValues)
             value = convertNameParts(defaultValue.value, resolveExternalModuleAndFn(config.namingConvention?.enumValues), config?.namingConvention?.transformUnderscore);
 
-          appliedDirectivesGen = `${appliedDirectivesGen}.default(${visitor.convertName(type.name.value)}.${value})`;
+          const enumTypeName = visitor.prefixTypeNamespace(
+            visitor.convertSchemaName(type.name.value, visitor.getType(type.name.value)?.astNode?.kind),
+          );
+          appliedDirectivesGen = `${appliedDirectivesGen}.default(${enumTypeName}.${value})`;
         }
         else {
           appliedDirectivesGen = `${appliedDirectivesGen}.default("${escapeGraphQLCharacters(defaultValue.value)}")`;
@@ -358,31 +364,13 @@ function generateNameNodeMyZodSchema(config: ValidationSchemaPluginConfig, visit
   }
 }
 
-function maybeLazy(type: TypeNode, schema: string): string {
-  if (isNamedType(type) && isInput(type.name.value))
-    return `myzod.lazy(() => ${schema})`;
-
-  return schema;
+function maybeLazy(visitor: Visitor, type: TypeNode, schema: string): string {
+  return buildMaybeLazy(visitor, type, schema, s => `myzod.lazy(() => ${s})`);
 }
 
 function myzod4Scalar(config: ValidationSchemaPluginConfig, visitor: Visitor, scalarName: string): string {
-  if (config.scalarSchemas?.[scalarName])
-    return config.scalarSchemas[scalarName];
-
-  const tsType = visitor.getScalarType(scalarName);
-  switch (tsType) {
-    case 'string':
-      return `myzod.string()`;
-    case 'number':
-      return `myzod.number()`;
-    case 'boolean':
-      return `myzod.boolean()`;
-  }
-
-  if (config.defaultScalarTypeSchema) {
-    return config.defaultScalarTypeSchema;
-  }
-
-  console.warn('unhandled name:', scalarName);
-  return anySchema;
+  return buildScalarSchema(config, visitor, scalarName, {
+    typeMap: { string: 'myzod.string()', number: 'myzod.number()', boolean: 'myzod.boolean()' },
+    fallback: anySchema,
+  });
 }

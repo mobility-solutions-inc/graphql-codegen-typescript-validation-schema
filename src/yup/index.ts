@@ -22,12 +22,13 @@ import { buildApi, formatDirectiveConfig } from '../directive.js';
 import {
   escapeGraphQLCharacters,
   InterfaceTypeDefinitionBuilder,
-  isInput,
   isListType,
   isNamedType,
   isNonNullType,
   ObjectTypeDefinitionBuilder,
 } from '../graphql.js';
+import { buildMaybeLazy } from '../lazy.js';
+import { buildScalarSchema } from '../scalar.js';
 import { BaseSchemaVisitor } from '../schema_visitor.js';
 
 export class YupSchemaVisitor extends BaseSchemaVisitor {
@@ -174,9 +175,11 @@ export class YupSchemaVisitor extends BaseSchemaVisitor {
     return {
       leave: (node: EnumTypeDefinitionNode) => {
         const visitor = this.createVisitor('both');
-        const enumname = visitor.convertName(node.name.value);
+        const enumname = visitor.convertSchemaName(node.name.value, node.kind);
         const enumTypeName = visitor.prefixTypeNamespace(enumname);
         this.importTypes.push(enumname);
+        if (!this.config.enumsAsTypes)
+          this.importValueTypes.push(enumname);
 
         // hoise enum declarations
         if (this.config.enumsAsTypes) {
@@ -301,8 +304,15 @@ function shapeFields(fields: readonly (FieldDefinitionNode | InputValueDefinitio
 
             if (config.namingConvention?.enumValues)
               value = convertNameParts(defaultValue.value, resolveExternalModuleAndFn(config.namingConvention?.enumValues), config?.namingConvention?.transformUnderscore);
-
-            fieldSchema = `${fieldSchema}.default(${visitor.convertName(field.name.value)}.${value})`;
+            const enumName = isNonNullType(field.type) && isNamedType(field.type.type)
+              ? field.type.type.name.value
+              : isNamedType(field.type)
+                ? field.type.name.value
+                : field.name.value;
+            const enumTypeName = visitor.prefixTypeNamespace(
+              visitor.convertSchemaName(enumName, visitor.getType(enumName)?.astNode?.kind),
+            );
+            fieldSchema = `${fieldSchema}.default(${enumTypeName}.${value})`;
           }
           else {
             fieldSchema = `${fieldSchema}.default("${escapeGraphQLCharacters(defaultValue.value)}")`;
@@ -324,20 +334,20 @@ function generateFieldYupSchema(config: ValidationSchemaPluginConfig, visitor: V
     const formatted = formatDirectiveConfig(config.directives);
     gen += buildApi(formatted, field.directives);
   }
-  return indent(`${field.name.value}: ${maybeLazy(field.type, gen)}`, indentCount);
+  return indent(`${field.name.value}: ${maybeLazy(visitor, field.type, gen)}`, indentCount);
 }
 
 function generateFieldTypeYupSchema(config: ValidationSchemaPluginConfig, visitor: Visitor, type: TypeNode, parentType?: TypeNode): string {
   if (isListType(type)) {
     const gen = generateFieldTypeYupSchema(config, visitor, type.type, type);
     if (!isNonNullType(parentType))
-      return `yup.array(${maybeLazy(type.type, gen)}).defined().nullable()`;
+      return `yup.array(${maybeLazy(visitor, type.type, gen)}).defined().nullable()`;
 
-    return `yup.array(${maybeLazy(type.type, gen)}).defined()`;
+    return `yup.array(${maybeLazy(visitor, type.type, gen)}).defined()`;
   }
   if (isNonNullType(type)) {
     const gen = generateFieldTypeYupSchema(config, visitor, type.type, type);
-    return maybeLazy(type.type, gen);
+    return maybeLazy(visitor, type.type, gen);
   }
   if (isNamedType(type)) {
     const gen = generateNameNodeYupSchema(config, visitor, type.name);
@@ -380,32 +390,14 @@ function generateNameNodeYupSchema(config: ValidationSchemaPluginConfig, visitor
   }
 }
 
-function maybeLazy(type: TypeNode, schema: string): string {
-  if (isNamedType(type) && isInput(type.name.value)) {
-    // https://github.com/jquense/yup/issues/1283#issuecomment-786559444
-    return `yup.lazy(() => ${schema})`;
-  }
-  return schema;
+function maybeLazy(visitor: Visitor, type: TypeNode, schema: string): string {
+  return buildMaybeLazy(visitor, type, schema, s => `yup.lazy(() => ${s})`);
 }
 
 function yup4Scalar(config: ValidationSchemaPluginConfig, visitor: Visitor, scalarName: string): string {
-  if (config.scalarSchemas?.[scalarName])
-    return `${config.scalarSchemas[scalarName]}.defined()`;
-
-  const tsType = visitor.getScalarType(scalarName);
-  switch (tsType) {
-    case 'string':
-      return `yup.string().defined()`;
-    case 'number':
-      return `yup.number().defined()`;
-    case 'boolean':
-      return `yup.boolean().defined()`;
-  }
-
-  if (config.defaultScalarTypeSchema) {
-    return config.defaultScalarTypeSchema
-  }
-
-  console.warn('unhandled name:', scalarName);
-  return `yup.mixed()`;
+  return buildScalarSchema(config, visitor, scalarName, {
+    typeMap: { string: 'yup.string().defined()', number: 'yup.number().defined()', boolean: 'yup.boolean().defined()' },
+    fallback: 'yup.mixed()',
+    wrapCustom: s => `${s}.defined()`,
+  });
 }

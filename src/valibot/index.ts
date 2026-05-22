@@ -12,17 +12,18 @@ import type {
 } from 'graphql';
 import type { ValidationSchemaPluginConfig } from '../config.js';
 import type { Visitor } from '../visitor.js';
-
 import { DeclarationBlock, indent } from '@graphql-codegen/visitor-plugin-common';
+
 import { buildApiForValibot, formatDirectiveConfig } from '../directive.js';
 import {
   InterfaceTypeDefinitionBuilder,
-  isInput,
   isListType,
   isNamedType,
   isNonNullType,
   ObjectTypeDefinitionBuilder,
 } from '../graphql.js';
+import { buildMaybeLazy } from '../lazy.js';
+import { buildScalarSchema } from '../scalar.js';
 import { BaseSchemaVisitor } from '../schema_visitor.js';
 
 export class ValibotSchemaVisitor extends BaseSchemaVisitor {
@@ -124,9 +125,11 @@ export class ValibotSchemaVisitor extends BaseSchemaVisitor {
     return {
       leave: (node: EnumTypeDefinitionNode) => {
         const visitor = this.createVisitor('both');
-        const enumname = visitor.convertName(node.name.value);
+        const enumname = visitor.convertSchemaName(node.name.value, node.kind);
         const enumTypeName = visitor.prefixTypeNamespace(enumname);
         this.importTypes.push(enumname);
+        if (!this.config.enumsAsTypes)
+          this.importValueTypes.push(enumname);
 
         // hoist enum declarations
         this.enumDeclarations.push(
@@ -205,13 +208,13 @@ export class ValibotSchemaVisitor extends BaseSchemaVisitor {
 
 function generateFieldValibotSchema(config: ValidationSchemaPluginConfig, visitor: Visitor, field: InputValueDefinitionNode | FieldDefinitionNode, indentCount: number): string {
   const gen = generateFieldTypeValibotSchema(config, visitor, field, field.type);
-  return indent(`${field.name.value}: ${maybeLazy(field.type, gen)}`, indentCount);
+  return indent(`${field.name.value}: ${gen}`, indentCount);
 }
 
 function generateFieldTypeValibotSchema(config: ValidationSchemaPluginConfig, visitor: Visitor, field: InputValueDefinitionNode | FieldDefinitionNode, type: TypeNode, parentType?: TypeNode): string {
   if (isListType(type)) {
     const gen = generateFieldTypeValibotSchema(config, visitor, field, type.type, type);
-    const arrayGen = `v.array(${maybeLazy(type.type, gen)})`;
+    const arrayGen = `v.array(${gen})`;
     if (!isNonNullType(parentType))
       return `v.nullish(${arrayGen})`;
 
@@ -219,24 +222,25 @@ function generateFieldTypeValibotSchema(config: ValidationSchemaPluginConfig, vi
   }
   if (isNonNullType(type)) {
     const gen = generateFieldTypeValibotSchema(config, visitor, field, type.type, type);
-    return maybeLazy(type.type, gen);
+    return gen;
   }
   if (isNamedType(type)) {
     const gen = generateNameNodeValibotSchema(config, visitor, type.name);
     if (isListType(parentType))
-      return `v.nullable(${gen})`;
+      return `v.nullable(${maybeLazy(visitor, type, gen)})`;
 
     const actions = actionsFromDirectives(config, field);
+    const schema = maybeLazy(visitor, type, pipeSchemaAndActions(gen, actions));
 
     if (isNonNullType(parentType)) {
       if (visitor.shouldEmitAsNotAllowEmptyString(type.name.value)) {
         actions.push('v.minLength(1)');
       }
 
-      return pipeSchemaAndActions(gen, actions);
+      return maybeLazy(visitor, type, pipeSchemaAndActions(gen, actions));
     }
 
-    return `v.nullish(${pipeSchemaAndActions(gen, actions)})`;
+    return `v.nullish(${schema})`;
   }
   console.warn('unhandled type:', type);
   return '';
@@ -283,31 +287,13 @@ function generateNameNodeValibotSchema(config: ValidationSchemaPluginConfig, vis
   }
 }
 
-function maybeLazy(type: TypeNode, schema: string): string {
-  if (isNamedType(type) && isInput(type.name.value))
-    return `v.lazy(() => ${schema})`;
-
-  return schema;
+function maybeLazy(visitor: Visitor, type: TypeNode, schema: string): string {
+  return buildMaybeLazy(visitor, type, schema, s => `v.lazy(() => ${s})`);
 }
 
 function valibot4Scalar(config: ValidationSchemaPluginConfig, visitor: Visitor, scalarName: string): string {
-  if (config.scalarSchemas?.[scalarName])
-    return config.scalarSchemas[scalarName];
-
-  const tsType = visitor.getScalarType(scalarName);
-  switch (tsType) {
-    case 'string':
-      return `v.string()`;
-    case 'number':
-      return `v.number()`;
-    case 'boolean':
-      return `v.boolean()`;
-  }
-
-  if (config.defaultScalarTypeSchema) {
-    return config.defaultScalarTypeSchema;
-  }
-
-  console.warn('unhandled scalar name:', scalarName);
-  return 'v.any()';
+  return buildScalarSchema(config, visitor, scalarName, {
+    typeMap: { string: 'v.string()', number: 'v.number()', boolean: 'v.boolean()' },
+    fallback: 'v.any()',
+  });
 }

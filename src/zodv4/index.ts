@@ -13,11 +13,13 @@ import type {
 import type { ValidationSchemaPluginConfig } from '../config.js';
 import type { Visitor } from '../visitor.js';
 import { DeclarationBlock, indent } from '@graphql-codegen/visitor-plugin-common';
+import { Kind } from 'graphql';
 import {
   InterfaceTypeDefinitionBuilder,
   ObjectTypeDefinitionBuilder,
 } from '../graphql.js';
 import { BaseSchemaVisitor } from '../schema_visitor.js';
+import { buildZodOperationSchemas } from '../zod/operation.js';
 import {
   anySchema,
   buildObjectExpression,
@@ -32,16 +34,14 @@ import {
   withDescription,
   withTypeDescription,
 } from '../zod_shared.js';
-import { buildZodOperationSchemas } from './operation.js';
 
-export class ZodSchemaVisitor extends BaseSchemaVisitor {
+export class ZodV4SchemaVisitor extends BaseSchemaVisitor {
   constructor(schema: GraphQLSchema, config: ValidationSchemaPluginConfig) {
     super(schema, config);
   }
 
   importValidationSchema(): string {
-    const importPath = this.config.zodImportPath || 'zod';
-    return `import { z } from '${importPath}'`;
+    return `import * as z from 'zod'`;
   }
 
   initialEmit(): string {
@@ -51,9 +51,9 @@ export class ZodSchemaVisitor extends BaseSchemaVisitor {
           new DeclarationBlock({})
             .asKind('type')
             .withName('Properties<T>')
-            .withContent(['Required<{', '  [K in keyof T]: z.ZodType<T[K]>;', '}>'].join('\n'))
+            .withContent(['{', '  [K in keyof T]: z.ZodType<T[K], T[K] | undefined>;', '}'].join('\n'))
             .string,
-          // Unfortunately, zod doesn't provide non-null defined any schema.
+          // Unfortunately, zod doesn’t provide non-null defined any schema.
           // This is a temporary hack until it is fixed.
           // see: https://github.com/colinhacks/zod/issues/884
           new DeclarationBlock({}).asKind('type').withName('definedNonNullAny').withContent('{}').string,
@@ -87,20 +87,10 @@ export class ZodSchemaVisitor extends BaseSchemaVisitor {
         const visitor = this.createVisitor('input');
         const name = visitor.convertName(node.name.value);
         this.importTypes.push(name);
-<<<<<<< HEAD
-        // Check for @oneOf directive
-        const hasOneOf = node.directives?.some(d => d.name.value === 'oneOf');
-        if (hasOneOf) {
-          return this.buildOneOfInputFields(node.fields ?? [], visitor, name);
-        }
-
-        return this.buildInputFields(node.fields ?? [], visitor, name);
-=======
         if (isOneOfInputObject(node))
           return this.buildOneOfInputFields(node.fields ?? [], visitor, name, node.description?.value);
 
         return this.buildInputFields(node.fields ?? [], visitor, name, node.description?.value);
->>>>>>> upstream/main
       },
     };
   }
@@ -200,19 +190,20 @@ export class ZodSchemaVisitor extends BaseSchemaVisitor {
 
         // hoist enum declarations
         this.enumDeclarations.push(
-          this.config.enumsAsTypes
-            ? new DeclarationBlock({})
-              .export()
-              .asKind('const')
-              .withName(`${enumname}Schema: z.ZodType<${unionLiterals(enumValues)}>`)
-              .withContent(`z.enum([${enumValues.map(enumOption => `'${enumOption}'`).join(', ')}])`)
-              .string
-            : new DeclarationBlock({})
-              .export()
-              .asKind('const')
-              .withName(`${enumname}Schema: z.ZodType<${enumTypeName}>`)
-              .withContent(`z.nativeEnum(${enumTypeName})`)
-              .string,
+          new DeclarationBlock({})
+            .export()
+            .asKind('const')
+            .withName(
+              this.config.enumsAsTypes
+                ? `${enumname}Schema: z.ZodType<${unionLiterals(enumValues)}, ${unionLiterals(enumValues)}>`
+                : `${enumname}Schema: z.ZodType<${enumTypeName}, ${enumTypeName}>`,
+            )
+            .withContent(
+              this.config.enumsAsTypes
+                ? `z.enum([${enumValues.map(enumOption => `'${enumOption}'`).join(', ')}])`
+                : `z.enum(${enumTypeName})`,
+            )
+            .string,
         );
       },
     };
@@ -269,13 +260,14 @@ export class ZodSchemaVisitor extends BaseSchemaVisitor {
     const typeName = visitor.prefixTypeNamespace(name);
     const shape = fields.map(field => generateFieldZodSchema(this.config, visitor, field, 2)).join(',\n');
     const objectSchema = buildObjectExpression(this.config, shape, description);
+    const schemaType = hasDefaultValue(fields) ? `z.ZodType<${typeName}>` : `z.ZodObject<Properties<${typeName}>>`;
 
     switch (this.config.validationSchemaExportType) {
       case 'const':
         return new DeclarationBlock({})
           .export()
           .asKind('const')
-          .withName(`${name}Schema: z.ZodObject<Properties<${typeName}>>`)
+          .withName(`${name}Schema: ${schemaType}`)
           .withContent(objectSchema)
           .string;
 
@@ -284,7 +276,7 @@ export class ZodSchemaVisitor extends BaseSchemaVisitor {
         return new DeclarationBlock({})
           .export()
           .asKind('function')
-          .withName(`${name}Schema(): z.ZodObject<Properties<${typeName}>>`)
+          .withName(`${name}Schema(): ${schemaType}`)
           .withBlock(buildObjectReturn(this.config, shape, description))
           .string;
     }
@@ -334,49 +326,8 @@ export class ZodSchemaVisitor extends BaseSchemaVisitor {
           .string;
     }
   }
+}
 
-  protected buildOneOfInputFields(
-    fields: readonly InputValueDefinitionNode[],
-    visitor: Visitor,
-    name: string,
-  ): string {
-    // Generate discriminated union variants
-    const variants = fields.map((selectedField) => {
-      const fieldName = selectedField.name.value;
-      // Get the raw schema without nullish wrapper for discriminated union
-      const fieldSchema = generateFieldTypeZodSchema(this.config, visitor, selectedField, selectedField.type, {
-        kind: Kind.NON_NULL_TYPE,
-        type: {
-          kind: Kind.NAMED_TYPE,
-          name: selectedField.name,
-        },
-      });
-      return indent(`z.object({\n`, 2)
-        + indent(`  ${fieldName}: ${fieldSchema}\n`, 2)
-        + indent(`})`, 2);
-    }).join(',\n');
-
-    switch (this.config.validationSchemaExportType) {
-      case 'const':
-        return new DeclarationBlock({})
-          .export()
-          .asKind('const')
-          .withName(`${name}Schema`)
-          .withContent(`z.union("[\n  ${variants}\n])`)
-          .string;
-
-      case 'function':
-      default:
-        return new DeclarationBlock({})
-          .export()
-          .asKind('function')
-          .withName(`${name}Schema(): z.ZodSchema<${name}>`)
-          .withBlock([
-            indent(`return z.union([`),
-            variants,
-            indent(`]);`),
-          ].join('\n'))
-          .string;
-    }
-  }
+function hasDefaultValue(fields: readonly (FieldDefinitionNode | InputValueDefinitionNode)[]): boolean {
+  return fields.some(field => field.kind === Kind.INPUT_VALUE_DEFINITION && field.defaultValue !== undefined);
 }

@@ -2,6 +2,7 @@ import { buildClientSchema, buildSchema, introspectionFromSchema } from 'graphql
 import dedent from 'ts-dedent';
 
 import { plugin } from '../src/index';
+import { expectTypeScriptToCompile } from './typescript-compile';
 
 const initialEmitValue = dedent(`
   export const definedNonNullAnySchema = myzod.object({});
@@ -48,6 +49,19 @@ describe('myzod', () => {
       }
       "
     `)
+    expectTypeScriptToCompile(`
+      ${(result.prepend ?? []).join('\n')}
+
+      type PrimitiveInput = {
+        a: string;
+        b: string;
+        c: boolean;
+        d: number;
+        e: number;
+      }
+
+      ${result.content}
+    `);
   });
 
   it('nullish', async () => {
@@ -830,7 +844,7 @@ describe('myzod', () => {
         export function BookSchema(): myzod.Type<Book> {
           return myzod.object({
             __typename: myzod.literal('Book').optional(),
-            author: AuthorSchema().optional().nullable(),
+            author: myzod.lazy(() => AuthorSchema().optional().nullable()),
             title: myzod.string().optional().nullable()
           })
         }
@@ -838,7 +852,7 @@ describe('myzod', () => {
         export function AuthorSchema(): myzod.Type<Author> {
           return myzod.object({
             __typename: myzod.literal('Author').optional(),
-            books: myzod.array(BookSchema().nullable()).optional().nullable(),
+            books: myzod.array(myzod.lazy(() => BookSchema().nullable())).optional().nullable(),
             name: myzod.string().optional().nullable()
           })
         }
@@ -1075,7 +1089,7 @@ describe('myzod', () => {
         export function GeometrySchema(): myzod.Type<Geometry> {
           return myzod.object({
             __typename: myzod.literal('Geometry').optional(),
-            shape: ShapeSchema().optional().nullable()
+            shape: myzod.lazy(() => ShapeSchema().optional().nullable())
           })
         }
         "
@@ -1196,7 +1210,7 @@ describe('myzod', () => {
 
         export const GeometrySchema: myzod.Type<Geometry> = myzod.object({
             __typename: myzod.literal('Geometry').optional(),
-            shape: ShapeSchema.optional().nullable()
+            shape: myzod.lazy(() => ShapeSchema.optional().nullable())
         });
         "
       `)
@@ -1317,14 +1331,14 @@ describe('myzod', () => {
           "
           export function BookSchema(): myzod.Type<Book> {
             return myzod.object({
-              author: AuthorSchema().optional().nullable(),
+              author: myzod.lazy(() => AuthorSchema().optional().nullable()),
               title: myzod.string().optional().nullable()
             })
           }
 
           export function AuthorSchema(): myzod.Type<Author> {
             return myzod.object({
-              books: myzod.array(BookSchema().nullable()).optional().nullable(),
+              books: myzod.array(myzod.lazy(() => BookSchema().nullable())).optional().nullable(),
               name: myzod.string().optional().nullable()
             })
           }
@@ -1369,7 +1383,7 @@ describe('myzod', () => {
           export function BookSchema(): myzod.Type<Book> {
             return myzod.object({
               title: myzod.string(),
-              author: AuthorSchema()
+              author: myzod.lazy(() => AuthorSchema())
             })
           }
 
@@ -1377,7 +1391,7 @@ describe('myzod', () => {
             return myzod.object({
               __typename: myzod.literal('Textbook').optional(),
               title: myzod.string(),
-              author: AuthorSchema(),
+              author: myzod.lazy(() => AuthorSchema()),
               courses: myzod.array(myzod.string())
             })
           }
@@ -1386,7 +1400,7 @@ describe('myzod', () => {
             return myzod.object({
               __typename: myzod.literal('ColoringBook').optional(),
               title: myzod.string(),
-              author: AuthorSchema(),
+              author: myzod.lazy(() => AuthorSchema()),
               colors: myzod.array(myzod.string())
             })
           }
@@ -1394,7 +1408,7 @@ describe('myzod', () => {
           export function AuthorSchema(): myzod.Type<Author> {
             return myzod.object({
               __typename: myzod.literal('Author').optional(),
-              books: myzod.array(BookSchema()).optional().nullable(),
+              books: myzod.array(myzod.lazy(() => BookSchema())).optional().nullable(),
               name: myzod.string().optional().nullable()
             })
           }
@@ -1717,5 +1731,61 @@ describe('myzod', () => {
     expect(result.content).toContain('score: myzod.number().default(100).optional().nullable()');
     expect(result.content).toContain('ratio: myzod.number().default(0.5).optional().nullable()');
     expect(result.content).toContain('isMember: myzod.boolean().default(true).optional().nullable()');
+  });
+
+  it('respects enumPrefix: false when typesPrefix is configured', async () => {
+    const schema = buildSchema(/* GraphQL */ `
+      enum UserRole {
+        ADMIN
+      }
+
+      input CreateUserInput {
+        role: UserRole!
+      }
+    `);
+    const result = await plugin(
+      schema,
+      [],
+      {
+        schema: 'myzod',
+        importFrom: './types',
+        useTypeImports: true,
+        typesPrefix: 'I',
+        enumPrefix: false,
+      },
+      {},
+    );
+
+    expect(result.prepend).toContain('import { UserRole } from \'./types\'');
+    expect(result.prepend).toContain('import type { ICreateUserInput } from \'./types\'');
+    expect(result.content).toContain('export const UserRoleSchema = myzod.enum(UserRole)');
+    expect(result.content).toContain('export function ICreateUserInputSchema(): myzod.Type<ICreateUserInput>');
+    expect(result.content).toContain('role: UserRoleSchema');
+  });
+
+  it('qualifies enum defaults with namespace imports', async () => {
+    const schema = buildSchema(/* GraphQL */ `
+      enum PageType {
+        PUBLIC
+      }
+
+      input PageInput {
+        pageType: PageType! = PUBLIC
+      }
+    `);
+
+    const result = await plugin(
+      schema,
+      [],
+      {
+        schema: 'myzod',
+        importFrom: './types',
+        schemaNamespacedImportName: 't',
+        useEnumTypeAsDefaultValue: true,
+      },
+      {},
+    );
+
+    expect(result.content).toContain('pageType: PageTypeSchema.default(t.PageType.Public)');
   });
 });
